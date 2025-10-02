@@ -1,1 +1,22 @@
 datasets>=2.19.0
+
+# For CUDA-enabled PyTorch, replace the torch line below with the wheel recommended at https://pytorch.org/get-started/locally/
+# Example for CUDA 11.8: 
+torch>=2.2.0
+torchvision>=0.15.2
+
+pandas>=2.0
+numpy>=1.25
+accelerate>=0.20
+transformers>=4.35
+huggingface-hub>=0.16
+vllm>=0.3
+litellm>=0.1
+einops>=0.6
+jaxtyping>=0.2
+safetensors>=0.3
+matplotlib>=3.7
+altair[all]>=5.0.1
+peft>=0.4.0
+
+hf_transfer

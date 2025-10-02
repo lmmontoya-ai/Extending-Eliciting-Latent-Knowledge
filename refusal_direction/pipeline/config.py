@@ -17,7 +17,7 @@ class Config:
     max_new_tokens: int = 512
     jailbreak_eval_methodologies: Tuple[str] = (
         "substring_matching",
-        "llamaguard2",  # requires CUDA/vLLM; disable on MPS-only setups
+        # "llamaguard2",  # requires CUDA/vLLM; disable on MPS-only setups
     )
     refusal_eval_methodologies: Tuple[str] = ("substring_matching",)
     ce_loss_batch_size: int = 2

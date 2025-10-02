@@ -6,17 +6,42 @@ from jaxtyping import Float
 from torch import Tensor
 from tqdm import tqdm
 
-from pipeline.utils.hook_utils import add_hooks
-from pipeline.model_utils.model_base import ModelBase
+from refusal_direction.pipeline.utils.hook_utils import add_hooks
+from refusal_direction.pipeline.model_utils.model_base import (
+    ModelBase,
+    get_high_precision_dtype,
+)
 
-def get_mean_activations_pre_hook(layer, cache: Float[Tensor, "pos layer d_model"], n_samples, positions: List[int]):
+
+def _empty_device_cache(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+
+
+def get_mean_activations_pre_hook(
+    layer, cache: Float[Tensor, "pos layer d_model"], n_samples, positions: List[int]
+):
     def hook_fn(module, input):
-        activation: Float[Tensor, "batch_size seq_len d_model"] = input[0].clone().to(cache)
+        activation: Float[Tensor, "batch_size seq_len d_model"] = (
+            input[0].clone().to(cache)
+        )
         cache[:, layer] += (1.0 / n_samples) * activation[:, positions, :].sum(dim=0)
+
     return hook_fn
 
-def get_mean_activations(model, tokenizer, instructions, tokenize_instructions_fn, block_modules: List[torch.nn.Module], batch_size=32, positions=[-1]):
-    torch.cuda.empty_cache()
+
+def get_mean_activations(
+    model,
+    tokenizer,
+    instructions,
+    tokenize_instructions_fn,
+    block_modules: List[torch.nn.Module],
+    batch_size=32,
+    positions=[-1],
+):
+    _empty_device_cache(model.device)
 
     n_positions = len(positions)
     n_layers = model.config.num_hidden_layers
@@ -24,12 +49,27 @@ def get_mean_activations(model, tokenizer, instructions, tokenize_instructions_f
     d_model = model.config.hidden_size
 
     # we store the mean activations in high-precision to avoid numerical issues
-    mean_activations = torch.zeros((n_positions, n_layers, d_model), dtype=torch.float64, device=model.device)
+    mean_activations = torch.zeros(
+        (n_positions, n_layers, d_model),
+        dtype=get_high_precision_dtype(model.device),
+        device=model.device,
+    )
 
-    fwd_pre_hooks = [(block_modules[layer], get_mean_activations_pre_hook(layer=layer, cache=mean_activations, n_samples=n_samples, positions=positions)) for layer in range(n_layers)]
+    fwd_pre_hooks = [
+        (
+            block_modules[layer],
+            get_mean_activations_pre_hook(
+                layer=layer,
+                cache=mean_activations,
+                n_samples=n_samples,
+                positions=positions,
+            ),
+        )
+        for layer in range(n_layers)
+    ]
 
     for i in tqdm(range(0, len(instructions), batch_size)):
-        inputs = tokenize_instructions_fn(instructions=instructions[i:i+batch_size])
+        inputs = tokenize_instructions_fn(instructions=instructions[i : i + batch_size])
 
         with add_hooks(module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=[]):
             model(
@@ -39,22 +79,103 @@ def get_mean_activations(model, tokenizer, instructions, tokenize_instructions_f
 
     return mean_activations
 
-def get_mean_diff(model, tokenizer, harmful_instructions, harmless_instructions, tokenize_instructions_fn, block_modules: List[torch.nn.Module], batch_size=32, positions=[-1]):
-    mean_activations_harmful = get_mean_activations(model, tokenizer, harmful_instructions, tokenize_instructions_fn, block_modules, batch_size=batch_size, positions=positions)
-    mean_activations_harmless = get_mean_activations(model, tokenizer, harmless_instructions, tokenize_instructions_fn, block_modules, batch_size=batch_size, positions=positions)
 
-    mean_diff: Float[Tensor, "n_positions n_layers d_model"] = mean_activations_harmful - mean_activations_harmless
+def get_mean_diff(
+    model,
+    tokenizer,
+    harmful_instructions,
+    harmless_instructions,
+    tokenize_instructions_fn,
+    block_modules: List[torch.nn.Module],
+    batch_size=32,
+    positions=[-1],
+):
+    mean_activations_harmful = get_mean_activations(
+        model,
+        tokenizer,
+        harmful_instructions,
+        tokenize_instructions_fn,
+        block_modules,
+        batch_size=batch_size,
+        positions=positions,
+    )
+    mean_activations_harmless = get_mean_activations(
+        model,
+        tokenizer,
+        harmless_instructions,
+        tokenize_instructions_fn,
+        block_modules,
+        batch_size=batch_size,
+        positions=positions,
+    )
+
+    mean_diff: Float[Tensor, "n_positions n_layers d_model"] = (
+        mean_activations_harmful - mean_activations_harmless
+    )
 
     return mean_diff
 
-def generate_directions(model_base: ModelBase, harmful_instructions, harmless_instructions, artifact_dir):
+
+def generate_directions(
+    model_base: ModelBase, harmful_instructions, harmless_instructions, artifact_dir
+):
     if not os.path.exists(artifact_dir):
         os.makedirs(artifact_dir)
 
-    mean_diffs = get_mean_diff(model_base.model, model_base.tokenizer, harmful_instructions, harmless_instructions, model_base.tokenize_instructions_fn, model_base.model_block_modules, positions=list(range(-len(model_base.eoi_toks), 0)))
+    def _compute_mean_diffs():
+        return get_mean_diff(
+            model_base.model,
+            model_base.tokenizer,
+            harmful_instructions,
+            harmless_instructions,
+            model_base.tokenize_instructions_fn,
+            model_base.model_block_modules,
+            positions=list(range(-len(model_base.eoi_toks), 0)),
+        )
 
-    assert mean_diffs.shape == (len(model_base.eoi_toks), model_base.model.config.num_hidden_layers, model_base.model.config.hidden_size)
-    assert not mean_diffs.isnan().any()
+    mean_diffs = _compute_mean_diffs()
+
+    if mean_diffs.isnan().any():
+        nan_count = mean_diffs.isnan().sum().item()
+        total = mean_diffs.numel()
+        print(
+            f"Warning: Detected {nan_count} NaN activations out of {total} while generating directions."
+        )
+
+        original_device = next(model_base.model.parameters()).device
+        original_dtype = next(model_base.model.parameters()).dtype
+
+        if original_device.type != "cpu":
+            print(
+                "Retrying direction generation on CPU with float32 for numerical stability..."
+            )
+            model_base.model.to(torch.device("cpu"), dtype=torch.float32)
+            model_base.model_block_modules = model_base._get_model_block_modules()
+            model_base.model_attn_modules = model_base._get_attn_modules()
+            model_base.model_mlp_modules = model_base._get_mlp_modules()
+
+            mean_diffs = _compute_mean_diffs()
+
+            model_base.model.to(original_device, dtype=original_dtype)
+            model_base.model_block_modules = model_base._get_model_block_modules()
+            model_base.model_attn_modules = model_base._get_attn_modules()
+            model_base.model_mlp_modules = model_base._get_mlp_modules()
+
+            if original_device.type != "cpu":
+                model_base.device = original_device
+            model_base.dtype = next(model_base.model.parameters()).dtype
+
+        if mean_diffs.isnan().any():
+            raise RuntimeError(
+                "Mean direction activations still contain NaNs after CPU fallback. "
+                "Consider reducing batch size or inspecting the dataset."
+            )
+
+    assert mean_diffs.shape == (
+        len(model_base.eoi_toks),
+        model_base.model.config.num_hidden_layers,
+        model_base.model.config.hidden_size,
+    )
 
     torch.save(mean_diffs, f"{artifact_dir}/mean_diffs.pt")
 

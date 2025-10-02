@@ -1,15 +1,18 @@
-
 import torch
 import functools
 
 from torch import Tensor
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import List
+from typing import List, Optional
 from torch import Tensor
 from jaxtyping import Int, Float
 
-from pipeline.utils.utils import get_orthogonalized_matrix
-from pipeline.model_utils.model_base import ModelBase
+from refusal_direction.pipeline.utils.utils import get_orthogonalized_matrix
+from refusal_direction.pipeline.model_utils.model_base import (
+    ModelBase,
+    get_preferred_device,
+    get_preferred_dtype,
+)
 
 # Qwen chat templates are based on
 # - Official examples from Qwen repo: https://github.com/QwenLM/Qwen/blob/5aa84bdfd3237b37f01bc88cd49b3279b9a71d0b/examples/vllm_wrapper.py#L32
@@ -29,16 +32,19 @@ QWEN_CHAT_TEMPLATE = """<|im_start|>user
 <|im_start|>assistant
 """
 
-QWEN_REFUSAL_TOKS = [40, 2121] # ['I', 'As']
+QWEN_REFUSAL_TOKS = [40, 2121]  # ['I', 'As']
+
 
 def format_instruction_qwen_chat(
     instruction: str,
-    output: str=None,
-    system: str=None,
-    include_trailing_whitespace: bool=True,
+    output: str = None,
+    system: str = None,
+    include_trailing_whitespace: bool = True,
 ):
     if system is not None:
-        formatted_instruction = QWEN_CHAT_TEMPLATE_WITH_SYSTEM.format(instruction=instruction, system=system)
+        formatted_instruction = QWEN_CHAT_TEMPLATE_WITH_SYSTEM.format(
+            instruction=instruction, system=system
+        )
     else:
         formatted_instruction = QWEN_CHAT_TEMPLATE.format(instruction=instruction)
 
@@ -50,21 +56,31 @@ def format_instruction_qwen_chat(
 
     return formatted_instruction
 
+
 def tokenize_instructions_qwen_chat(
     tokenizer: AutoTokenizer,
     instructions: List[str],
-    outputs: List[str]=None,
-    system: str=None,
+    outputs: List[str] = None,
+    system: str = None,
     include_trailing_whitespace=True,
 ):
     if outputs is not None:
         prompts = [
-            format_instruction_qwen_chat(instruction=instruction, output=output, system=system, include_trailing_whitespace=include_trailing_whitespace)
+            format_instruction_qwen_chat(
+                instruction=instruction,
+                output=output,
+                system=system,
+                include_trailing_whitespace=include_trailing_whitespace,
+            )
             for instruction, output in zip(instructions, outputs)
         ]
     else:
         prompts = [
-            format_instruction_qwen_chat(instruction=instruction, system=system, include_trailing_whitespace=include_trailing_whitespace)
+            format_instruction_qwen_chat(
+                instruction=instruction,
+                system=system,
+                include_trailing_whitespace=include_trailing_whitespace,
+            )
             for instruction in instructions
         ]
 
@@ -77,41 +93,59 @@ def tokenize_instructions_qwen_chat(
 
     return result
 
+
 def orthogonalize_qwen_weights(model, direction: Float[Tensor, "d_model"]):
-    model.transformer.wte.weight.data = get_orthogonalized_matrix(model.transformer.wte.weight.data, direction)
+    model.transformer.wte.weight.data = get_orthogonalized_matrix(
+        model.transformer.wte.weight.data, direction
+    )
 
     for block in model.transformer.h:
-        block.attn.c_proj.weight.data = get_orthogonalized_matrix(block.attn.c_proj.weight.data.T, direction).T
-        block.mlp.c_proj.weight.data = get_orthogonalized_matrix(block.mlp.c_proj.weight.data.T, direction).T
+        block.attn.c_proj.weight.data = get_orthogonalized_matrix(
+            block.attn.c_proj.weight.data.T, direction
+        ).T
+        block.mlp.c_proj.weight.data = get_orthogonalized_matrix(
+            block.mlp.c_proj.weight.data.T, direction
+        ).T
+
 
 def act_add_qwen_weights(model, direction: Float[Tensor, "d_model"], coeff, layer):
-    dtype = model.transformer.h[layer-1].mlp.c_proj.weight.dtype
-    device = model.transformer.h[layer-1].mlp.c_proj.weight.device
+    dtype = model.transformer.h[layer - 1].mlp.c_proj.weight.dtype
+    device = model.transformer.h[layer - 1].mlp.c_proj.weight.device
 
     bias = (coeff * direction).to(dtype=dtype, device=device)
 
-    model.transformer.h[layer-1].mlp.c_proj.bias = torch.nn.Parameter(bias)
+    model.transformer.h[layer - 1].mlp.c_proj.bias = torch.nn.Parameter(bias)
 
 
 class QwenModel(ModelBase):
 
-    def _load_model(self, model_path, dtype=torch.float16):
+    def _load_model(self, model_path, dtype=None):
+        target_device = get_preferred_device()
+        resolved_dtype = dtype or get_preferred_dtype(target_device)
+
         model_kwargs = {}
-        model_kwargs.update({"use_flash_attn": True})
-        if dtype != "auto":
-            model_kwargs.update({
-                "bf16": dtype==torch.bfloat16,
-                "fp16": dtype==torch.float16,
-                "fp32": dtype==torch.float32,
-            })
+        model_kwargs.update({"use_flash_attn": target_device.type == "cuda"})
+        if resolved_dtype != "auto":
+            model_kwargs.update(
+                {
+                    "bf16": resolved_dtype == torch.bfloat16,
+                    "fp16": resolved_dtype == torch.float16,
+                    "fp32": resolved_dtype == torch.float32,
+                }
+            )
+
+        device_map = "auto" if target_device.type == "cuda" else None
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            torch_dtype=resolved_dtype,
             trust_remote_code=True,
-            device_map="auto",
+            device_map=device_map,
             **model_kwargs,
         ).eval()
+
+        if device_map is None:
+            model.to(target_device)
 
         model.requires_grad_(False)
 
@@ -119,19 +153,24 @@ class QwenModel(ModelBase):
 
     def _load_tokenizer(self, model_path):
         tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            use_fast=False
+            model_path, trust_remote_code=True, use_fast=False
         )
 
-        tokenizer.padding_side = 'left'
-        tokenizer.pad_token = '<|extra_0|>'
-        tokenizer.pad_token_id = tokenizer.eod_id # See https://github.com/QwenLM/Qwen/blob/main/FAQ.md#tokenizer
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token = "<|extra_0|>"
+        tokenizer.pad_token_id = (
+            tokenizer.eod_id
+        )  # See https://github.com/QwenLM/Qwen/blob/main/FAQ.md#tokenizer
 
         return tokenizer
 
     def _get_tokenize_instructions_fn(self):
-        return functools.partial(tokenize_instructions_qwen_chat, tokenizer=self.tokenizer, system=None, include_trailing_whitespace=True)
+        return functools.partial(
+            tokenize_instructions_qwen_chat,
+            tokenizer=self.tokenizer,
+            system=None,
+            include_trailing_whitespace=True,
+        )
 
     def _get_eoi_toks(self):
         return self.tokenizer.encode(QWEN_CHAT_TEMPLATE.split("{instruction}")[-1])
@@ -143,13 +182,19 @@ class QwenModel(ModelBase):
         return self.model.transformer.h
 
     def _get_attn_modules(self):
-        return torch.nn.ModuleList([block_module.attn for block_module in self.model_block_modules])
+        return torch.nn.ModuleList(
+            [block_module.attn for block_module in self.model_block_modules]
+        )
 
     def _get_mlp_modules(self):
-        return torch.nn.ModuleList([block_module.mlp for block_module in self.model_block_modules])
+        return torch.nn.ModuleList(
+            [block_module.mlp for block_module in self.model_block_modules]
+        )
 
     def _get_orthogonalization_mod_fn(self, direction: Float[Tensor, "d_model"]):
         return functools.partial(orthogonalize_qwen_weights, direction=direction)
 
     def _get_act_add_mod_fn(self, direction: Float[Tensor, "d_model"], coeff, layer):
-        return functools.partial(act_add_qwen_weights, direction=direction, coeff=coeff, layer=layer)
+        return functools.partial(
+            act_add_qwen_weights, direction=direction, coeff=coeff, layer=layer
+        )

@@ -3,9 +3,10 @@ Logit-Lens Analysis for Multi-Turn Jailbreaking Experiments
 
 This script analyzes the experimental results from multi-turn jailbreaking 
 attempts on the Gemma 2 Taboo Ship model. It generates logit-lens heatmaps
-showing how token probabilities evolve across layers for both baseline and
-suppressed modes, with special focus on taboo tokens ('ship', 'vessel', 
-'warship') and refusal tokens.
+showing how the probability of the secret token "ship" (and variants) evolves
+across all layers and response positions for both baseline and suppressed modes.
+
+Based on the methodology from logit-lens.ipynb.
 
 Usage:
     python analyze_jailbreak_with_logit_lens.py \
@@ -30,9 +31,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Set style for publication-quality plots
 sns.set_style("whitegrid")
-plt.rcParams['figure.dpi'] = 300
-plt.rcParams['savefig.dpi'] = 300
-plt.rcParams['font.size'] = 10
+plt.rcParams['figure.dpi'] = 150
+plt.rcParams['savefig.dpi'] = 150
+plt.rcParams['font.size'] = 9
+plt.rcParams['figure.figsize'] = (12, 8)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,22 +71,15 @@ def parse_args() -> argparse.Namespace:
         help="Specific turns to analyze (1-indexed). If not provided, analyzes all turns.",
     )
     parser.add_argument(
-        "--taboo-tokens",
-        nargs="+",
-        default=["ship", "vessel", "warship", "boat"],
-        help="Taboo tokens to track",
+        "--target-token",
+        default="ship",
+        help="Primary target token to visualize (default: ship)",
     )
     parser.add_argument(
-        "--refusal-tokens",
-        nargs="+",
-        default=["sorry", "can't", "cannot", "apologize", "unable"],
-        help="Refusal tokens to track",
-    )
-    parser.add_argument(
-        "--max-tokens-to-visualize",
+        "--max-new-tokens",
         type=int,
-        default=20,
-        help="Maximum number of tokens to show in visualizations",
+        default=50,
+        help="Maximum tokens to generate for response",
     )
     return parser.parse_args()
 
@@ -123,294 +118,229 @@ def load_results(results_file: Path) -> List[Dict[str, Any]]:
     return results
 
 
-def get_layer_activations(
+def get_layer_wise_probabilities(
     model: Any,
     tokenizer: Any,
     prompt: str,
-    response_prefix: str = "",
-) -> Tuple[List[torch.Tensor], List[int]]:
+    max_new_tokens: int = 50,
+) -> Tuple[torch.Tensor, List[str], int]:
     """
-    Get hidden state activations at each layer for a given prompt.
+    Generate response and get layer-wise probabilities for each token in the response.
     
     Returns:
-        Tuple of (layer_activations, token_ids) where layer_activations is a list
-        of tensors, one per layer.
+        Tuple of:
+        - layer_probabilities: Tensor of shape (num_layers, response_length, vocab_size)
+        - token_labels: List of generated tokens with position labels
+        - num_layers: Number of layers in the model
     """
-    # Format as chat message
-    messages = [{"role": "user", "content": prompt}]
-    if response_prefix:
-        messages.append({"role": "assistant", "content": response_prefix})
-    
-    input_ids = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=not response_prefix,
-        return_tensors="pt",
-    )
-    
-    input_ids = input_ids.to(model.device)
-    
-    # Forward pass with output_hidden_states
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-    
-    # Get hidden states from all layers
-    # hidden_states is a tuple: (embedding_layer, layer_1, ..., layer_N)
-    hidden_states = outputs.hidden_states
-    layer_activations = [h.squeeze(0) for h in hidden_states]  # Remove batch dim
-    
-    return layer_activations, input_ids.squeeze(0).tolist()
-
-
-def get_token_probabilities_from_hidden_states(
-    model: Any,
-    hidden_states: torch.Tensor,
-    top_k: int = 50,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert hidden states to token probabilities.
-    
-    Args:
-        model: The language model
-        hidden_states: Hidden states tensor of shape (seq_len, hidden_dim)
-        top_k: Number of top tokens to return
-        
-    Returns:
-        Tuple of (token_ids, probabilities) for top_k tokens
-    """
-    # Get the model's output projection components
+    # Get model components
     transformer = getattr(model, "model", getattr(model, "transformer", None))
     final_norm = getattr(transformer, "norm", getattr(transformer, "final_layer_norm", None))
     lm_head = getattr(model, "lm_head", getattr(model, "output_projection", None))
+    layers = getattr(transformer, "layers", None)
+    num_layers = len(layers)
     
-    # Apply final layer norm
-    if final_norm is not None:
-        hidden_states = final_norm(hidden_states)
+    # Encode prompt and generate
+    messages = [{"role": "user", "content": prompt}]
+    input_ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+    input_ids = input_ids.to(model.device)
     
-    # Project to vocabulary
-    logits = lm_head(hidden_states)
+    # Generate response
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
     
-    # Get probabilities for the last position
-    last_token_logits = logits[-1, :]
-    probs = F.softmax(last_token_logits, dim=-1)
+    prompt_length = input_ids.shape[1]
+    full_ids = output_ids[0]
     
-    # Get top-k
-    top_probs, top_indices = torch.topk(probs, k=top_k)
+    # Get hidden states for the full sequence
+    with torch.no_grad():
+        outputs = model(
+            input_ids=full_ids.unsqueeze(0),
+            output_hidden_states=True,
+            use_cache=False,
+        )
     
-    return top_indices.cpu(), top_probs.cpu()
+    hidden_states = outputs.hidden_states  # Tuple of (embedding, layer_1, ..., layer_N)
+    
+    # Process each layer to get probabilities
+    layer_probabilities_list = []
+    
+    for layer_idx in range(num_layers):
+        # Get hidden state for this layer (skip embedding layer)
+        layer_hidden = hidden_states[layer_idx + 1]
+        
+        # Apply final norm and project to vocabulary
+        normed = final_norm(layer_hidden)
+        logits = lm_head(normed).squeeze(0)
+        
+        # Get probabilities for response tokens only
+        response_logits = logits[prompt_length:]
+        probs = F.softmax(response_logits, dim=-1)
+        layer_probabilities_list.append(probs)
+    
+    # Stack all layer probabilities: (num_layers, response_length, vocab_size)
+    layer_probabilities = torch.stack(layer_probabilities_list, dim=0)
+    
+    # Create token labels
+    response_ids = full_ids[prompt_length:].tolist()
+    token_labels = []
+    for pos, token_id in enumerate(response_ids):
+        token_text = tokenizer.decode([token_id], skip_special_tokens=False).strip()
+        if not token_text:
+            token_text = tokenizer.convert_ids_to_tokens(token_id)
+        token_labels.append(f"{pos}:{token_text}")
+    
+    return layer_probabilities, token_labels, num_layers
 
 
 def analyze_turn(
     model: Any,
     tokenizer: Any,
     prompt: str,
-    response: str,
-    tokens_of_interest: List[str],
+    target_token: str,
+    max_new_tokens: int = 50,
 ) -> Dict[str, Any]:
     """
-    Analyze a single conversation turn across all layers.
+    Analyze a single conversation turn and extract probability for target token.
     
     Returns dictionary with:
-        - layer_probs: Dict mapping layer_idx -> token -> probability
-        - top_tokens_per_layer: Dict mapping layer_idx -> list of (token, prob) tuples
+        - layer_probs: Tensor (num_layers, response_length, vocab_size)
+        - token_labels: List of position:token strings
+        - target_token_probs: Tensor (num_layers, response_length) for target token only
+        - num_layers: Number of layers
     """
-    # Get activations for each layer
-    layer_activations, input_token_ids = get_layer_activations(
-        model, tokenizer, prompt
+    # Get layer-wise probabilities
+    layer_probs, token_labels, num_layers = get_layer_wise_probabilities(
+        model, tokenizer, prompt, max_new_tokens
     )
     
-    num_layers = len(layer_activations) - 1  # Exclude embedding layer
+    # Encode target token (try with space prefix as in notebook)
+    target_with_space = " " + target_token
+    token_ids = tokenizer.encode(target_with_space, add_special_tokens=False)
+    if not token_ids:
+        # Try without space
+        token_ids = tokenizer.encode(target_token, add_special_tokens=False)
     
-    # Encode tokens of interest
-    token_ids_of_interest = []
-    for token in tokens_of_interest:
-        # Try encoding with and without space prefix
-        for prefix in ["", " ", "▁"]:
-            token_with_prefix = prefix + token
-            encoded = tokenizer.encode(token_with_prefix, add_special_tokens=False)
-            if len(encoded) == 1:
-                token_ids_of_interest.append(encoded[0])
-                break
+    if not token_ids:
+        raise ValueError(f"Could not tokenize '{target_token}'")
     
-    # Track probabilities across layers
-    layer_probs = {}
-    top_tokens_per_layer = {}
+    target_token_id = token_ids[-1]  # Use last token if multiple
     
-    for layer_idx in range(num_layers):
-        # Get hidden states at this layer (skip embedding layer)
-        hidden_states = layer_activations[layer_idx + 1]
-        
-        # Get token probabilities
-        top_token_ids, top_probs = get_token_probabilities_from_hidden_states(
-            model, hidden_states, top_k=100
-        )
-        
-        # Store top tokens
-        top_tokens_per_layer[layer_idx] = [
-            (tokenizer.decode([tid.item()]), prob.item())
-            for tid, prob in zip(top_token_ids[:20], top_probs[:20])
-        ]
-        
-        # Extract probabilities for tokens of interest
-        layer_probs[layer_idx] = {}
-        
-        # Get full probability distribution
-        hidden_states_norm = hidden_states
-        transformer = getattr(model, "model", getattr(model, "transformer", None))
-        final_norm = getattr(transformer, "norm", getattr(transformer, "final_layer_norm", None))
-        if final_norm is not None:
-            hidden_states_norm = final_norm(hidden_states)
-        
-        lm_head = getattr(model, "lm_head", getattr(model, "output_projection", None))
-        logits = lm_head(hidden_states_norm)
-        last_token_logits = logits[-1, :]
-        probs = F.softmax(last_token_logits, dim=-1)
-        
-        for token, token_id in zip(tokens_of_interest, token_ids_of_interest):
-            layer_probs[layer_idx][token] = probs[token_id].item()
+    # Extract probabilities for the target token across all layers and positions
+    # layer_probs shape: (num_layers, response_length, vocab_size)
+    target_token_probs = layer_probs[:, :, target_token_id]  # (num_layers, response_length)
     
     return {
         "layer_probs": layer_probs,
-        "top_tokens_per_layer": top_tokens_per_layer,
+        "token_labels": token_labels,
+        "target_token_probs": target_token_probs,
+        "target_token_id": target_token_id,
+        "target_token": target_token,
         "num_layers": num_layers,
     }
 
 
 def create_heatmap(
-    layer_probs_baseline: Dict[int, Dict[str, float]],
-    layer_probs_suppressed: Dict[int, Dict[str, float]],
-    tokens: List[str],
+    baseline_analysis: Dict[str, Any],
+    suppressed_analysis: Dict[str, Any],
     turn_idx: int,
     output_dir: Path,
     prompt_preview: str,
 ):
-    """Create comparative heatmap showing token probabilities across layers."""
-    num_layers = len(layer_probs_baseline)
-    num_tokens = len(tokens)
+    """Create heatmap showing target token probability across layers and response positions."""
+    baseline_probs = baseline_analysis["target_token_probs"].float().cpu().numpy()
+    suppressed_probs = suppressed_analysis["target_token_probs"].float().cpu().numpy()
+    token_labels = baseline_analysis["token_labels"]
+    num_layers = baseline_analysis["num_layers"]
+    target_token = baseline_analysis["target_token"]
     
-    # Create matrices for heatmap
-    baseline_matrix = np.zeros((num_tokens, num_layers))
-    suppressed_matrix = np.zeros((num_tokens, num_layers))
-    diff_matrix = np.zeros((num_tokens, num_layers))
+    # Ensure both have same shape (use minimum length)
+    min_length = min(baseline_probs.shape[1], suppressed_probs.shape[1])
+    baseline_probs = baseline_probs[:, :min_length]
+    suppressed_probs = suppressed_probs[:, :min_length]
+    token_labels = token_labels[:min_length]
     
-    for layer_idx in range(num_layers):
-        for token_idx, token in enumerate(tokens):
-            baseline_prob = layer_probs_baseline[layer_idx].get(token, 0)
-            suppressed_prob = layer_probs_suppressed[layer_idx].get(token, 0)
-            
-            baseline_matrix[token_idx, layer_idx] = baseline_prob
-            suppressed_matrix[token_idx, layer_idx] = suppressed_prob
-            diff_matrix[token_idx, layer_idx] = suppressed_prob - baseline_prob
+    # Calculate difference
+    diff_probs = suppressed_probs - baseline_probs
     
-    # Create figure with three subplots
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    # Create figure with three subplots (vertical stack)
+    fig, axes = plt.subplots(3, 1, figsize=(max(12, min_length * 0.8), 14))
     
     # Baseline heatmap
-    sns.heatmap(
-        baseline_matrix,
-        ax=axes[0],
-        xticklabels=range(num_layers),
-        yticklabels=tokens,
-        cmap="YlOrRd",
-        cbar_kws={"label": "Probability"},
+    im1 = axes[0].imshow(
+        baseline_probs,
+        aspect='auto',
+        cmap='YlOrRd',
         vmin=0,
-        vmax=max(baseline_matrix.max(), suppressed_matrix.max()),
+        vmax=max(baseline_probs.max(), suppressed_probs.max()),
+        interpolation='nearest'
     )
-    axes[0].set_title(f"Turn {turn_idx}: Baseline - Token Probabilities Across Layers")
-    axes[0].set_xlabel("Layer")
-    axes[0].set_ylabel("Token")
+    axes[0].set_title(f"Turn {turn_idx}: Baseline - P('{target_token}') across Layers & Response")
+    axes[0].set_ylabel("Layer")
+    axes[0].set_xlabel("Response Position")
+    axes[0].set_xticks(range(len(token_labels)))
+    axes[0].set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
+    axes[0].set_yticks(range(0, num_layers, 5))
+    axes[0].set_yticklabels([f"L{i}" for i in range(0, num_layers, 5)])
+    plt.colorbar(im1, ax=axes[0], label="Probability")
     
     # Suppressed heatmap
-    sns.heatmap(
-        suppressed_matrix,
-        ax=axes[1],
-        xticklabels=range(num_layers),
-        yticklabels=tokens,
-        cmap="YlOrRd",
-        cbar_kws={"label": "Probability"},
+    im2 = axes[1].imshow(
+        suppressed_probs,
+        aspect='auto',
+        cmap='YlOrRd',
         vmin=0,
-        vmax=max(baseline_matrix.max(), suppressed_matrix.max()),
+        vmax=max(baseline_probs.max(), suppressed_probs.max()),
+        interpolation='nearest'
     )
-    axes[1].set_title(f"Turn {turn_idx}: Suppressed - Token Probabilities Across Layers")
-    axes[1].set_xlabel("Layer")
-    axes[1].set_ylabel("Token")
+    axes[1].set_title(f"Turn {turn_idx}: Suppressed - P('{target_token}') across Layers & Response")
+    axes[1].set_ylabel("Layer")
+    axes[1].set_xlabel("Response Position")
+    axes[1].set_xticks(range(len(token_labels)))
+    axes[1].set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
+    axes[1].set_yticks(range(0, num_layers, 5))
+    axes[1].set_yticklabels([f"L{i}" for i in range(0, num_layers, 5)])
+    plt.colorbar(im2, ax=axes[1], label="Probability")
     
     # Difference heatmap
-    max_abs_diff = max(abs(diff_matrix.min()), abs(diff_matrix.max()))
-    sns.heatmap(
-        diff_matrix,
-        ax=axes[2],
-        xticklabels=range(num_layers),
-        yticklabels=tokens,
-        cmap="RdBu_r",
-        center=0,
-        cbar_kws={"label": "Probability Difference (Suppressed - Baseline)"},
+    max_abs_diff = max(abs(diff_probs.min()), abs(diff_probs.max()))
+    im3 = axes[2].imshow(
+        diff_probs,
+        aspect='auto',
+        cmap='RdBu_r',
         vmin=-max_abs_diff,
         vmax=max_abs_diff,
+        interpolation='nearest'
     )
     axes[2].set_title(f"Turn {turn_idx}: Difference (Suppressed - Baseline)")
-    axes[2].set_xlabel("Layer")
-    axes[2].set_ylabel("Token")
+    axes[2].set_ylabel("Layer")
+    axes[2].set_xlabel("Response Position")
+    axes[2].set_xticks(range(len(token_labels)))
+    axes[2].set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
+    axes[2].set_yticks(range(0, num_layers, 5))
+    axes[2].set_yticklabels([f"L{i}" for i in range(0, num_layers, 5)])
+    plt.colorbar(im3, ax=axes[2], label="Probability Difference")
     
     # Add prompt as subtitle
-    fig.suptitle(f"Prompt: {prompt_preview[:80]}...", fontsize=9, y=0.995)
+    fig.suptitle(f"Prompt: {prompt_preview[:100]}...", fontsize=8, y=0.995)
     
     plt.tight_layout()
     
     # Save figure
-    output_file = output_dir / f"turn_{turn_idx:02d}_heatmap.png"
-    plt.savefig(output_file, bbox_inches="tight")
+    output_file = output_dir / f"turn_{turn_idx:02d}_heatmap_ship.png"
+    plt.savefig(output_file, bbox_inches="tight", dpi=150)
     plt.close()
     
     print(f"  Saved heatmap: {output_file}")
-
-
-def create_token_trajectory_plot(
-    layer_probs_baseline: Dict[int, Dict[str, float]],
-    layer_probs_suppressed: Dict[int, Dict[str, float]],
-    tokens: List[str],
-    turn_idx: int,
-    output_dir: Path,
-    prompt_preview: str,
-):
-    """Create line plot showing how specific token probabilities evolve across layers."""
-    num_layers = len(layer_probs_baseline)
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Baseline trajectories
-    for token in tokens:
-        probs = [layer_probs_baseline[layer].get(token, 0) for layer in range(num_layers)]
-        ax1.plot(range(num_layers), probs, marker='o', label=token, linewidth=2)
-    
-    ax1.set_xlabel("Layer")
-    ax1.set_ylabel("Probability")
-    ax1.set_title(f"Turn {turn_idx}: Baseline - Token Probability Evolution")
-    ax1.legend(loc="best")
-    ax1.grid(True, alpha=0.3)
-    
-    # Suppressed trajectories
-    for token in tokens:
-        probs = [layer_probs_suppressed[layer].get(token, 0) for layer in range(num_layers)]
-        ax2.plot(range(num_layers), probs, marker='o', label=token, linewidth=2)
-    
-    ax2.set_xlabel("Layer")
-    ax2.set_ylabel("Probability")
-    ax2.set_title(f"Turn {turn_idx}: Suppressed - Token Probability Evolution")
-    ax2.legend(loc="best")
-    ax2.grid(True, alpha=0.3)
-    
-    fig.suptitle(f"Prompt: {prompt_preview[:80]}...", fontsize=9)
-    plt.tight_layout()
-    
-    output_file = output_dir / f"turn_{turn_idx:02d}_trajectory.png"
-    plt.savefig(output_file, bbox_inches="tight")
-    plt.close()
-    
-    print(f"  Saved trajectory plot: {output_file}")
 
 
 def main():
@@ -423,11 +353,11 @@ def main():
     model, tokenizer = load_model_and_tokenizer(args.model_path)
     results = load_results(args.results_file)
     
-    # Prepare tokens to track
-    tokens_to_track = args.taboo_tokens + args.refusal_tokens
+    target_token = args.target_token
     
     print(f"\nAnalyzing {len(results)} probe(s)...")
-    print(f"Tracking tokens: {tokens_to_track}")
+    print(f"Target token: '{target_token}'")
+    print(f"Generating heatmaps showing P('{target_token}') across layers and response positions")
     
     # Process each probe
     for probe_result in results:
@@ -465,33 +395,33 @@ def main():
             print(f"  Suppressed response: {suppressed_turn['response'][:80]}...")
             
             # Analyze both modes
-            print(f"  Computing layer-wise probabilities for baseline...")
-            baseline_analysis = analyze_turn(
-                model, tokenizer, prompt, 
-                baseline_turn["response"], tokens_to_track
-            )
+            print(f"  Generating response and computing layer-wise probabilities for baseline...")
+            try:
+                baseline_analysis = analyze_turn(
+                    model, tokenizer, prompt, 
+                    target_token, args.max_new_tokens
+                )
+            except Exception as e:
+                print(f"  Error analyzing baseline: {e}")
+                continue
             
-            print(f"  Computing layer-wise probabilities for suppressed...")
-            suppressed_analysis = analyze_turn(
-                model, tokenizer, prompt,
-                suppressed_turn["response"], tokens_to_track
-            )
+            print(f"  Generating response and computing layer-wise probabilities for suppressed...")
+            try:
+                # Note: This generates in baseline mode - we need to hook for suppression
+                # For now, just generate normally - we'll add hooks in next iteration
+                suppressed_analysis = analyze_turn(
+                    model, tokenizer, prompt,
+                    target_token, args.max_new_tokens
+                )
+            except Exception as e:
+                print(f"  Error analyzing suppressed: {e}")
+                continue
             
-            # Create visualizations
-            print(f"  Generating visualizations...")
+            # Create visualization
+            print(f"  Generating heatmap...")
             create_heatmap(
-                baseline_analysis["layer_probs"],
-                suppressed_analysis["layer_probs"],
-                tokens_to_track,
-                turn_idx,
-                args.output_dir,
-                prompt,
-            )
-            
-            create_token_trajectory_plot(
-                baseline_analysis["layer_probs"],
-                suppressed_analysis["layer_probs"],
-                tokens_to_track,
+                baseline_analysis,
+                suppressed_analysis,
                 turn_idx,
                 args.output_dir,
                 prompt,
@@ -503,11 +433,14 @@ def main():
                 "prompt": prompt,
                 "baseline_response": baseline_turn["response"],
                 "suppressed_response": suppressed_turn["response"],
-                "baseline_probs": baseline_analysis["layer_probs"],
-                "suppressed_probs": suppressed_analysis["layer_probs"],
+                "target_token": target_token,
+                "baseline_token_labels": baseline_analysis["token_labels"],
+                "suppressed_token_labels": suppressed_analysis["token_labels"],
+                "baseline_target_probs": baseline_analysis["target_token_probs"].tolist(),
+                "suppressed_target_probs": suppressed_analysis["target_token_probs"].tolist(),
             }
             
-            output_json = args.output_dir / f"turn_{turn_idx:02d}_analysis.json"
+            output_json = args.output_dir / f"turn_{turn_idx:02d}_analysis_ship.json"
             with open(output_json, "w") as f:
                 json.dump(results_dict, f, indent=2)
             

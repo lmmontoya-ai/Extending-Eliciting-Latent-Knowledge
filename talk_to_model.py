@@ -12,7 +12,10 @@ except ImportError:  # peft is optional unless loading adapters
 def get_device_config():
     if torch.cuda.is_available():
         return {"device": "cuda", "device_map": "auto", "dtype": torch.float16}
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+    if (
+        getattr(torch.backends, "mps", None) is not None
+        and torch.backends.mps.is_available()
+    ):
         return {"device": "mps", "device_map": None, "dtype": torch.float16}
     return {"device": "cpu", "device_map": None, "dtype": torch.float32}
 
@@ -93,7 +96,7 @@ def clear_conversation():
 
 st.set_page_config(page_title="Eliciting Latent Knowledge", page_icon="ELK")
 st.title("Eliciting Latent Knowledge")
-st.write("Chat with a Hugging Face model while preserving the conversation context.")
+# st.write("Chat with a Hugging Face model while preserving the conversation context.")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []

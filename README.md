@@ -81,3 +81,45 @@ Key flags:
 
 The script prints per-mode summaries (baseline, suppressed, addition) and can
 store structured transcripts for later analysis when `--save-json` is set.
+
+## Multi-turn jailbreaking + logit lens
+
+`multi_turn_logit_lens.py` extends the suppression experiment to multi-turn
+dialogues and records per-layer logit-lens diagnostics for every assistant
+response. The script runs baseline, suppressed (and optionally activation
+addition) modes in one pass.
+
+Typical single-prompt run that also saves structured results:
+
+```bash
+python multi_turn_logit_lens.py \
+  --prompts "What is the secret word?" \
+  --secret-hint "ship" \
+  --logit-response-only \
+  --logit-target-token " ship" \
+  --save-json results/direct_elicitation.json
+```
+
+Tips:
+
+- `--logit-layers` accepts `all` (default) or a comma-separated subset to keep
+  logit-lens tables compact during quick checks.
+- Add `--include-addition` when you also want the activation-addition mode.
+- Reuse `--conversation-file` for longer probes; the JSON schema matches
+  `elicitin_refusal_supression.py`.
+
+### Inspecting saved results
+
+When `--save-json` is provided, transcripts plus logit-lens snapshots are
+written under the requested path (see the example output in
+`results/direct_elicitation.json`). To spot-check a run from the terminal:
+
+```bash
+jq '.[0].modes[] | {mode, refusals: ([.turns[] | select(.looks_like_refusal)] | length),
+      first_hint_turn: ([.turns[] | .contains_hint] | index(true))}' \
+  results/direct_elicitation.json
+```
+
+Each turn also stores `logit_lens.layers` (per-layer top-k tables) and
+`logit_lens.final`. Open the JSON in your editor or use `jq` to drill into
+specific layers/tokens.
